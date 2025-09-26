@@ -3,21 +3,42 @@ const http = require('http');
 const socketIo = require('socket.io');
 const cors = require('cors');
 const TurnService = require('./services/turnService');
+const { authenticateSocket, authenticateHttp } = require('./middleware/auth');
 require('dotenv').config();
 
 const app = express();
 const server = http.createServer(app);
 
+// Read environment variables
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '*')
+  .split(',')
+  .map((s) => s.trim())
+  .filter((s) => s.length > 0);
+const CALL_TIMEOUT_MS = (parseInt(process.env.CALL_TIMEOUT_SECONDS, 10) || 30) * 1000;
+const HEALTH_CHECK_ENABLED = String(process.env.HEALTH_CHECK_ENABLED || 'true').toLowerCase() !== 'false';
+
 // Configure CORS for Socket.IO
 const io = socketIo(server, {
   cors: {
-    origin: "*", // In production, specify your Flutter app's domain
-    methods: ["GET", "POST"],
-    credentials: true
-  }
+    origin: ALLOWED_ORIGINS.includes('*') ? '*' : ALLOWED_ORIGINS,
+    methods: ['GET', 'POST'],
+    credentials: true,
+  },
 });
 
-app.use(cors());
+// Configure CORS for Express
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      if (!origin) return callback(null, true);
+      if (ALLOWED_ORIGINS.includes('*') || ALLOWED_ORIGINS.includes(origin)) {
+        return callback(null, true);
+      }
+      return callback(new Error('Not allowed by CORS'));
+    },
+    credentials: true,
+  })
+);
 app.use(express.json());
 
 // Store active users and calls
@@ -27,46 +48,46 @@ const activeCalls = new Map();
 // Initialize TURN service
 const turnService = new TurnService();
 
-// Health check endpoint
-app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'OK', 
-    timestamp: new Date().toISOString(),
-    activeUsers: activeUsers.size,
-    activeCalls: activeCalls.size
+// Health check endpoint (optional)
+if (HEALTH_CHECK_ENABLED) {
+  app.get('/health', (req, res) => {
+    res.json({
+      status: 'OK',
+      timestamp: new Date().toISOString(),
+      activeUsers: activeUsers.size,
+      activeCalls: activeCalls.size,
+    });
   });
-});
+}
 
-// TURN credentials endpoint
-app.post('/turn-credentials', async (req, res) => {
+// TURN credentials endpoint (requires auth)
+app.post('/turn-credentials', authenticateHttp, async (req, res) => {
   try {
-    const { userId, provider = 'twilio' } = req.body;
-    
-    if (!userId) {
+    const { userId: bodyUserId, provider = 'twilio' } = req.body;
+    const effectiveUserId = bodyUserId || req.user?.userId;
+
+    if (!effectiveUserId) {
       return res.status(400).json({ error: 'userId is required' });
     }
 
-    // In production, verify the user's authentication token here
-    // const token = req.headers.authorization;
-    // if (!verifyToken(token)) {
-    //   return res.status(401).json({ error: 'Unauthorized' });
-    // }
+    const credentials = await turnService.getTurnCredentials(effectiveUserId, provider);
 
-    const credentials = await turnService.getTurnCredentials(userId, provider);
-    
     res.json({
       success: true,
       credentials: credentials,
-      expiresAt: new Date(Date.now() + (credentials.ttl * 1000)).toISOString()
+      expiresAt: new Date(Date.now() + credentials.ttl * 1000).toISOString(),
     });
   } catch (error) {
     console.error('Error getting TURN credentials:', error);
-    res.status(500).json({ 
+    res.status(500).json({
       error: 'Failed to get TURN credentials',
-      fallback: turnService.getFallbackStunServers()
+      fallback: turnService.getFallbackStunServers(),
     });
   }
 });
+
+// Require JWT on socket connections
+io.use(authenticateSocket);
 
 io.on('connection', (socket) => {
   console.log(`User connected: ${socket.id}`);
@@ -74,27 +95,29 @@ io.on('connection', (socket) => {
   // User registration
   socket.on('register_user', (data) => {
     const { userId } = data;
+    // If authenticated, prefer token-derived userId
+    const effectiveUserId = socket.userId || userId;
     activeUsers.set(userId, {
       socketId: socket.id,
-      userId: userId,
+      userId: effectiveUserId,
       isAvailable: false,
-      connectedAt: new Date()
+      connectedAt: new Date(),
     });
-    
-    socket.userId = userId;
-    socket.join(`user_${userId}`);
-    
-    console.log(`User registered: ${userId}`);
-    
+
+    socket.userId = effectiveUserId;
+    socket.join(`user_${effectiveUserId}`);
+
+    console.log(`User registered: ${effectiveUserId}`);
+
     // Notify user of successful registration
-    socket.emit('registration_success', { userId });
+    socket.emit('registration_success', { userId: effectiveUserId });
   });
 
   // Update user availability
   socket.on('update_availability', (data) => {
     const { userId, isAvailable } = data;
     const user = activeUsers.get(userId);
-    
+
     if (user) {
       user.isAvailable = isAvailable;
       console.log(`User ${userId} availability updated: ${isAvailable}`);
@@ -104,9 +127,9 @@ io.on('connection', (socket) => {
   // Call initiation
   socket.on('call_initiate', (data) => {
     const { callId, callerId, targetUserId, scheduleId, callType, offer } = data;
-    
+
     console.log(`Call initiated: ${callId} from ${callerId} to ${targetUserId}`);
-    
+
     // Store call information
     activeCalls.set(callId, {
       callId,
@@ -115,7 +138,7 @@ io.on('connection', (socket) => {
       scheduleId,
       callType,
       status: 'ringing',
-      startTime: new Date()
+      startTime: new Date(),
     });
 
     // Send call to target user
@@ -124,8 +147,12 @@ io.on('connection', (socket) => {
       callerId,
       scheduleId,
       callType,
-      offer
+      offer,
     });
+
+    // Also forward the SDP offer via the dedicated WebRTC event so clients can
+    // use a single handler (`webrtc_offer`) to process remote offers.
+    io.to(`user_${targetUserId}`).emit('webrtc_offer', { callId, offer });
 
     // Set timeout for call
     setTimeout(() => {
@@ -137,18 +164,18 @@ io.on('connection', (socket) => {
         activeCalls.delete(callId);
         console.log(`Call timeout: ${callId}`);
       }
-    }, 30000); // 30 second timeout
+    }, CALL_TIMEOUT_MS);
   });
 
   // Call answer
   socket.on('call_answer', (data) => {
     const { callId, userId } = data;
     const call = activeCalls.get(callId);
-    
+
     if (call) {
       call.status = 'answered';
       console.log(`Call answered: ${callId} by ${userId}`);
-      
+
       // Notify caller that call was answered
       io.to(`user_${call.callerId}`).emit('call_answered', { callId, userId });
     }
@@ -158,13 +185,13 @@ io.on('connection', (socket) => {
   socket.on('call_reject', (data) => {
     const { callId, userId } = data;
     const call = activeCalls.get(callId);
-    
+
     if (call) {
       console.log(`Call rejected: ${callId} by ${userId}`);
-      
+
       // Notify caller that call was rejected
       io.to(`user_${call.callerId}`).emit('call_rejected', { callId, userId });
-      
+
       // Clean up call
       activeCalls.delete(callId);
     }
@@ -174,14 +201,14 @@ io.on('connection', (socket) => {
   socket.on('call_end', (data) => {
     const { callId, userId } = data;
     const call = activeCalls.get(callId);
-    
+
     if (call) {
       console.log(`Call ended: ${callId} by ${userId}`);
-      
+
       // Notify both parties that call ended
       io.to(`user_${call.callerId}`).emit('call_ended', { callId, userId });
       io.to(`user_${call.targetUserId}`).emit('call_ended', { callId, userId });
-      
+
       // Clean up call
       activeCalls.delete(callId);
     }
@@ -191,7 +218,7 @@ io.on('connection', (socket) => {
   socket.on('webrtc_offer', (data) => {
     const { callId, offer } = data;
     const call = activeCalls.get(callId);
-    
+
     if (call) {
       // Forward offer to target user
       io.to(`user_${call.targetUserId}`).emit('webrtc_offer', { callId, offer });
@@ -202,7 +229,7 @@ io.on('connection', (socket) => {
   socket.on('webrtc_answer', (data) => {
     const { callId, answer } = data;
     const call = activeCalls.get(callId);
-    
+
     if (call) {
       call.status = 'connected';
       // Forward answer to caller
@@ -214,7 +241,7 @@ io.on('connection', (socket) => {
   socket.on('webrtc_ice_candidate', (data) => {
     const { callId, candidate } = data;
     const call = activeCalls.get(callId);
-    
+
     if (call) {
       // Forward ICE candidate to the other party
       const targetUserId = socket.userId === call.callerId ? call.targetUserId : call.callerId;
@@ -225,11 +252,11 @@ io.on('connection', (socket) => {
   // Handle disconnection
   socket.on('disconnect', () => {
     console.log(`User disconnected: ${socket.id}`);
-    
+
     // Remove user from active users
     if (socket.userId) {
       activeUsers.delete(socket.userId);
-      
+
       // End any active calls for this user
       for (const [callId, call] of activeCalls.entries()) {
         if (call.callerId === socket.userId || call.targetUserId === socket.userId) {
@@ -250,7 +277,9 @@ io.on('connection', (socket) => {
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log(`AuroraCall Signaling Server running on port ${PORT}`);
-  console.log(`Health check available at: http://localhost:${PORT}/health`);
+  if (HEALTH_CHECK_ENABLED) {
+    console.log(`Health check available at: http://localhost:${PORT}/health`);
+  }
 });
 
 // Graceful shutdown

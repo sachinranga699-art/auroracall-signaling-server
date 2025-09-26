@@ -1,0 +1,22 @@
+# Production Environment Variables
+NODE_ENV=production
+PORT=3000
+
+# CORS (comma-separated list or * for all)
+ALLOWED_ORIGINS=https://auroracall.com,https://www.auroracall.com
+
+# Logging
+LOG_LEVEL=info
+
+# Call Configuration
+CALL_TIMEOUT_SECONDS=30
+MAX_CONCURRENT_CALLS=1000
+
+# Metered.ca TURN Service
+METERED_API_KEY=4d85ea549f5610c15788d65c60d461c17f13
+
+# Security (not used yet; keep for future)
+JWT_SECRET=auroracall_jwt_secret_2024_production_key_secure
+
+# Health Check
+HEALTH_CHECK_ENABLED=true
